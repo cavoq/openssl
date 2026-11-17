@@ -2454,6 +2454,14 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
         }
     }
 
+    /* RFC 9973: the ciphersuite and PSK selection depend on this extension */
+    if (SSL_CONNECTION_IS_VERSION13(s)
+        && !tls_parse_extension(s, TLSEXT_IDX_cert_with_extern_psk,
+            SSL_EXT_CLIENT_HELLO, clienthello->pre_proc_exts, NULL, 0)) {
+        /* SSLfatal() already called */
+        goto err;
+    }
+
     /* For TLSv1.3 we must select the ciphersuite *before* session resumption */
     if (SSL_CONNECTION_IS_VERSION13(s)) {
         const SSL_CIPHER *cipher = ssl3_choose_cipher(s, ciphers, SSL_get_ciphers(ssl));
@@ -2542,11 +2550,17 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
         if (i == 1) {
             /* previous session */
             s->hit = 1;
+            if (SSL_CONNECTION_CERT_WITH_EXTERN_PSK(s)
+                && !tls_cert_with_extern_psk_new_session(s)) {
+                /* SSLfatal() already called */
+                goto err;
+            }
         } else if (i == -1) {
             /* SSLfatal() already called */
             goto err;
         } else {
-            /* i == 0 */
+            /* i == 0, the selected PSK's session might have been rejected */
+            s->ext.cert_with_extern_psk = 0;
             if (!ssl_get_new_session(s, 1)) {
                 /* SSLfatal() already called */
                 goto err;
@@ -2910,7 +2924,7 @@ int tls_handle_alpn(SSL_CONNECTION *s)
                 /* Not consistent so can't be used for early_data */
                 s->ext.early_data_ok = 0;
 
-                if (!s->hit) {
+                if (!s->hit || SSL_CONNECTION_CERT_WITH_EXTERN_PSK(s)) {
                     /*
                      * This is a new session and so alpn_selected should have
                      * been initialised to NULL. We should update it with the

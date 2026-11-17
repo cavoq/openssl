@@ -465,6 +465,12 @@ static const EXTENSION_DEFINITION ext_defs[] = {
     INVALID_EXTENSION,
     INVALID_EXTENSION,
 #endif /* END_OPENSSL_NO_ECH */
+    { TLSEXT_TYPE_cert_with_extern_psk,
+        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_SERVER_HELLO
+            | SSL_EXT_TLS1_3_ONLY,
+        OSSL_ECH_HANDLING_CALL_BOTH,
+        NULL, tls_parse_ctos_cert_with_extern_psk, NULL,
+        tls_construct_stoc_cert_with_extern_psk, NULL, NULL },
     { /* RFC 8701 GREASE extension 1 - type is dynamic */
         TLSEXT_TYPE_grease1,
         SSL_EXT_CLIENT_HELLO,
@@ -1399,7 +1405,8 @@ static int final_server_name(SSL_CONNECTION *s, unsigned int context, int sent)
      * was successful.
      */
     if (s->server) {
-        if (sent && ret == SSL_TLSEXT_ERR_OK && !s->hit) {
+        if (sent && ret == SSL_TLSEXT_ERR_OK
+            && (!s->hit || SSL_CONNECTION_CERT_WITH_EXTERN_PSK(s))) {
             /* Only store the hostname in the session if we accepted it. */
             OPENSSL_free(s->session->ext.hostname);
             s->session->ext.hostname = OPENSSL_strdup(s->ext.hostname);
@@ -2128,8 +2135,12 @@ int tls_psk_do_binder(SSL_CONNECTION *s, const EVP_MD *md,
     } else {
         /* HMAC keys can't do EVP_DigestVerify* - use CRYPTO_memcmp instead */
         ret = (CRYPTO_memcmp(binderin, binderout, hashsize) == 0);
+        /* RFC 9973 Section 5.1 requires illegal_parameter instead */
         if (!ret)
-            SSLfatal(s, SSL_AD_DECRYPT_ERROR, SSL_R_BINDER_DOES_NOT_VERIFY);
+            SSLfatal(s,
+                tls_cert_with_extern_psk_offered(s) ? SSL_AD_ILLEGAL_PARAMETER
+                                                    : SSL_AD_DECRYPT_ERROR,
+                SSL_R_BINDER_DOES_NOT_VERIFY);
     }
 
 err:
@@ -2378,5 +2389,15 @@ static int init_client_cert_type(SSL_CONNECTION *sc, unsigned int context)
         sc->ext.client_cert_type_ctos = OSSL_CERT_TYPE_CTOS_NONE;
         sc->ext.client_cert_type = TLSEXT_cert_type_x509;
     }
+    return 1;
+}
+
+int tls_cert_with_extern_psk_new_session(SSL_CONNECTION *s)
+{
+    if (!ssl_get_new_session(s, s->server))
+        return 0;
+
+    s->session->cipher = s->s3.tmp.new_cipher;
+    s->verify_result = s->session->verify_result;
     return 1;
 }
