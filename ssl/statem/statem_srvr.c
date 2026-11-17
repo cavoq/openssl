@@ -776,7 +776,7 @@ static WRITE_TRAN ossl_statem_server13_write_transition(SSL_CONNECTION *s)
         return WRITE_TRAN_CONTINUE;
 
     case TLS_ST_SW_ENCRYPTED_EXTENSIONS:
-        if (s->hit)
+        if (s->hit && !SSL_CONNECTION_CERT_WITH_EXTERN_PSK(s))
             st->hand_state = TLS_ST_SW_FINISHED;
         else if (send_certificate_request(s))
             st->hand_state = TLS_ST_SW_CERT_REQ;
@@ -993,7 +993,8 @@ static WRITE_TRAN ossl_statem_server13_write_transition(SSL_CONNECTION *s)
          * been configured for.
          */
         if ((SSL_IS_FIRST_HANDSHAKE(s) || s->ext.extra_tickets_expected <= 0)
-            && (s->hit || s->num_tickets <= s->sent_tickets)) {
+            && ((s->hit && !SSL_CONNECTION_CERT_WITH_EXTERN_PSK(s))
+                || s->num_tickets <= s->sent_tickets)) {
             /* We've written enough tickets out. */
             st->hand_state = TLS_ST_OK;
         }
@@ -1535,7 +1536,8 @@ WORK_STATE ossl_statem_server_post_work(SSL_CONNECTION *s, WORK_STATE wst)
         break;
 
     case TLS_ST_SW_ENCRYPTED_EXTENSIONS:
-        if (!s->hit && !send_certificate_request(s)) {
+        if ((!s->hit || SSL_CONNECTION_CERT_WITH_EXTERN_PSK(s))
+            && !send_certificate_request(s)) {
             if (!SSL_CONNECTION_IS_VERSION13(s)
                 || (s->options & SSL_OP_NO_TX_CERTIFICATE_COMPRESSION) != 0)
                 s->ext.compress_certificate_from_peer[0] = TLSEXT_comp_cert_none;
@@ -2612,7 +2614,8 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
         goto err;
     }
 
-    if (!s->hit && !tls1_set_server_sigalgs(s)) {
+    if ((!s->hit || SSL_CONNECTION_CERT_WITH_EXTERN_PSK(s))
+        && !tls1_set_server_sigalgs(s)) {
         /* SSLfatal() already called */
         goto err;
     }
@@ -2970,7 +2973,8 @@ WORK_STATE tls_post_process_client_hello(SSL_CONNECTION *s, WORK_STATE wst)
     if (wst == WORK_MORE_B) {
         if (!s->hit || SSL_CONNECTION_IS_VERSION13(s)) {
             /* Let cert callback update server certificates if required */
-            if (!s->hit && s->cert->cert_cb != NULL) {
+            if ((!s->hit || SSL_CONNECTION_CERT_WITH_EXTERN_PSK(s))
+                && s->cert->cert_cb != NULL) {
                 int rv = s->cert->cert_cb(ussl, s->cert->cert_cb_arg);
 
                 if (rv == 0) {
@@ -2996,7 +3000,7 @@ WORK_STATE tls_post_process_client_hello(SSL_CONNECTION *s, WORK_STATE wst)
                 }
                 s->s3.tmp.new_cipher = cipher;
             }
-            if (!s->hit) {
+            if (!s->hit || SSL_CONNECTION_CERT_WITH_EXTERN_PSK(s)) {
                 if (!tls_choose_sigalg(s, 1)) {
                     /* SSLfatal already called */
                     goto err;
