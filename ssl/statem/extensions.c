@@ -102,6 +102,8 @@ static int final_maxfragmentlen(SSL_CONNECTION *s, unsigned int context,
     int sent);
 static int init_post_handshake_auth(SSL_CONNECTION *s, unsigned int context);
 static int final_psk(SSL_CONNECTION *s, unsigned int context, int sent);
+static int final_cert_with_extern_psk(SSL_CONNECTION *s, unsigned int context,
+    int sent);
 static int tls_init_compress_certificate(SSL_CONNECTION *sc, unsigned int context);
 static EXT_RETURN tls_construct_compress_certificate(SSL_CONNECTION *sc, WPACKET *pkt,
     unsigned int context,
@@ -465,12 +467,16 @@ static const EXTENSION_DEFINITION ext_defs[] = {
     INVALID_EXTENSION,
     INVALID_EXTENSION,
 #endif /* END_OPENSSL_NO_ECH */
-    { TLSEXT_TYPE_cert_with_extern_psk,
+    { /* RFC 9973. Must be after early_data, which picks the PSKs to offer */
+        TLSEXT_TYPE_cert_with_extern_psk,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_SERVER_HELLO
             | SSL_EXT_TLS1_3_ONLY,
         OSSL_ECH_HANDLING_CALL_BOTH,
-        NULL, tls_parse_ctos_cert_with_extern_psk, NULL,
-        tls_construct_stoc_cert_with_extern_psk, NULL, NULL },
+        NULL, tls_parse_ctos_cert_with_extern_psk,
+        tls_parse_stoc_cert_with_extern_psk,
+        tls_construct_stoc_cert_with_extern_psk,
+        tls_construct_ctos_cert_with_extern_psk,
+        final_cert_with_extern_psk },
     { /* RFC 8701 GREASE extension 1 - type is dynamic */
         TLSEXT_TYPE_grease1,
         SSL_EXT_CLIENT_HELLO,
@@ -2238,6 +2244,26 @@ static int final_psk(SSL_CONNECTION *s, unsigned int context, int sent)
     return 1;
 }
 
+/*
+ * RFC 9973 Section 7: abort if the server selects the external PSK offered with
+ * "tls_cert_with_extern_psk" without acknowledging the extension, as the PSK
+ * would then be the sole authentication.
+ */
+static int final_cert_with_extern_psk(SSL_CONNECTION *s, unsigned int context,
+    int sent)
+{
+    if (!s->server && !sent && s->hit
+        && (s->ext.extflags[TLSEXT_IDX_cert_with_extern_psk]
+               & SSL_EXT_FLAG_SENT)
+            != 0) {
+        SSLfatal(s, SSL_AD_HANDSHAKE_FAILURE,
+            SSL_R_MISSING_CERT_WITH_EXTERN_PSK_EXTENSION);
+        return 0;
+    }
+
+    return 1;
+}
+
 static int tls_init_compress_certificate(SSL_CONNECTION *sc, unsigned int context)
 {
     memset(sc->ext.compress_certificate_from_peer, 0,
@@ -2398,6 +2424,7 @@ int tls_cert_with_extern_psk_new_session(SSL_CONNECTION *s)
         return 0;
 
     s->session->cipher = s->s3.tmp.new_cipher;
+    s->session->flags |= SSL_SESS_FLAG_CERT_WITH_EXTERN_PSK;
     s->verify_result = s->session->verify_result;
     return 1;
 }
