@@ -9232,6 +9232,803 @@ end:
 }
 
 /*
+ * Set up a client and a server sharing an external PSK, where the client
+ * verifies the server certificate. With |dtls|, use DTLS rather than TLS.
+ */
+static int setup_cert_with_extern_psk_test(SSL_CTX **sctx, SSL_CTX **cctx,
+    const char *rootcert, int dtls)
+{
+    if (!TEST_true(create_ssl_ctx_pair(libctx,
+            dtls ? DTLS_server_method() : TLS_server_method(),
+            dtls ? DTLS_client_method() : TLS_client_method(),
+            dtls ? DTLS1_VERSION : TLS1_VERSION, 0, sctx, cctx, cert,
+            privkey))
+        || !TEST_true(SSL_CTX_set_ciphersuites(*cctx, "TLS_AES_128_GCM_SHA256"))
+        || !TEST_true(SSL_CTX_load_verify_locations(*cctx, rootcert, NULL)))
+        return 0;
+
+    SSL_CTX_set_verify(*cctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_psk_use_session_callback(*cctx, use_session_cb);
+    SSL_CTX_set_psk_find_session_callback(*sctx, find_session_cb);
+    srvid = pskid;
+    use_session_cb_cnt = 0;
+    find_session_cb_cnt = 0;
+
+    return 1;
+}
+
+/* Use the PSK alone with a client that doesn't offer the RFC 9973 extension */
+static int cert_with_extern_psk_client_hello_cb(SSL *s, int *al, void *arg)
+{
+    const unsigned char *ext;
+    size_t extlen;
+
+    if (!SSL_client_hello_get0_ext(s, TLSEXT_TYPE_cert_with_extern_psk, &ext,
+            &extlen))
+        SSL_clear_options(s, SSL_OP_CERT_WITH_EXTERN_PSK);
+
+    return SSL_CLIENT_HELLO_SUCCESS;
+}
+
+/* Shorten the key of the PSK |psk| to |len| bytes */
+static int shorten_psk(SSL_SESSION *psk, size_t len)
+{
+    unsigned char key[SHA384_DIGEST_LENGTH];
+    size_t keylen = SSL_SESSION_get_master_key(psk, key, sizeof(key));
+
+    return TEST_size_t_ge(keylen, len)
+        && TEST_true(SSL_SESSION_set1_master_key(psk, key, len));
+}
+
+/*
+ * Test the RFC 9973 "tls_cert_with_extern_psk" extension, which combines an
+ * external PSK with certificate-based authentication.
+ * Test 0: Both peers enable it
+ * Test 1: Both peers enable it and the server authenticates the client too
+ * Test 2: Both peers enable it and there is a HelloRetryRequest
+ * Test 3: Both peers enable it and the server prefers psk_ke, which can't be
+ *         used with the extension
+ * Test 4: Only the server enables it, so it refuses to use the PSK alone and a
+ *         full handshake takes place
+ * Test 5: Only the client enables it, so the client must refuse a server
+ *         that wants to use the PSK alone
+ * Test 6: Both peers enable it, but the server doesn't know the PSK, so a
+ *         full handshake takes place
+ * Test 7: Both peers enable it and the client prefers a ciphersuite that
+ *         doesn't match the PSK's hash, so the server picks another one
+ * Test 8: As test 7, and there is a HelloRetryRequest
+ * Test 9: As test 7, but with the server's preference
+ * Test 10: Both peers enable it, but no ciphersuite matches the PSK's hash, so
+ *          a full handshake takes place
+ * Test 11: As test 4, but the server requires a client certificate, which the
+ *          PSK can't replace, so the handshake fails
+ * Test 12: Both peers enable it, but the PSK is shorter than 128 bits, so the
+ *          client doesn't offer it and a full handshake takes place
+ * Test 13: As test 12, but only the server's PSK is too short, so the server
+ *          ignores it
+ * Test 14: Both peers enable it with DTLS
+ * Test 15: Both peers enable it, but the server doesn't know the PSK and its
+ *          HelloRetryRequest selects a ciphersuite of another hash, so the
+ *          client can't repeat the extension with the PSK and must abort
+ * Test 16: As test 4, but the server clears the option for a client without
+ *          the extension, so the PSK alone authenticates
+ */
+static int test_cert_with_extern_psk(int idx)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    char *rootcert = NULL;
+    int othercipher = idx >= 7 && idx <= 9, dtls = idx == 14;
+    int negotiated = idx <= 3 || othercipher || dtls;
+    int usepsk = negotiated || idx == 16;
+    int testresult = 0;
+
+#ifdef OPENSSL_NO_EC
+    if (idx == 2 || idx == 8 || idx == 15)
+        return TEST_skip("EC is disabled");
+#endif
+#ifdef OSSL_NO_USABLE_DTLS1_3
+    if (dtls)
+        return TEST_skip("DTLSv1.3 is not usable");
+#endif
+
+    if (!TEST_ptr(rootcert = test_mk_file_path(certsdir, "rootcert.pem"))
+        || !TEST_true(setup_cert_with_extern_psk_test(&sctx, &cctx, rootcert,
+            dtls)))
+        goto end;
+
+    if (idx != 4 && idx != 11 && idx != 16)
+        SSL_CTX_set_options(cctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    if (idx != 5)
+        SSL_CTX_set_options(sctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+
+    switch (idx) {
+    case 1:
+        /* The server certificate will do as client certificate */
+        if (!TEST_true(SSL_CTX_load_verify_locations(sctx, rootcert, NULL))
+            || !TEST_true(SSL_CTX_set_purpose(sctx, X509_PURPOSE_ANY))
+            || !TEST_int_eq(SSL_CTX_use_certificate_file(cctx, cert,
+                                SSL_FILETYPE_PEM),
+                1)
+            || !TEST_int_eq(SSL_CTX_use_PrivateKey_file(cctx, privkey,
+                                SSL_FILETYPE_PEM),
+                1))
+            goto end;
+        /* fall through */
+    case 11:
+        SSL_CTX_set_verify(sctx,
+            SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+        break;
+    case 2:
+        /* The server doesn't accept the client's key_share */
+        if (!TEST_true(SSL_CTX_set1_groups_list(cctx, "P-384:P-256"))
+            || !TEST_true(SSL_CTX_set1_groups_list(sctx, "P-256")))
+            goto end;
+        break;
+    case 3:
+        SSL_CTX_set_options(cctx, SSL_OP_ALLOW_NO_DHE_KEX);
+        SSL_CTX_set_options(sctx,
+            SSL_OP_ALLOW_NO_DHE_KEX | SSL_OP_PREFER_NO_DHE_KEX);
+        break;
+    case 6:
+        srvid = "Unknown identity";
+        break;
+    case 7:
+    case 8:
+        /* The PSK uses SHA-256 */
+        if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
+                "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256")))
+            goto end;
+        if (idx == 8
+            && (!TEST_true(SSL_CTX_set1_groups_list(cctx, "P-384:P-256"))
+                || !TEST_true(SSL_CTX_set1_groups_list(sctx, "P-256"))))
+            goto end;
+        break;
+    case 9:
+        if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
+                "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"))
+            || !TEST_true(SSL_CTX_set_ciphersuites(sctx,
+                "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256")))
+            goto end;
+        SSL_CTX_set_options(sctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
+        break;
+    case 10:
+        if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
+                "TLS_AES_256_GCM_SHA384")))
+            goto end;
+        break;
+    case 15:
+        /* The PSK uses SHA-256 */
+        if (!TEST_true(SSL_CTX_set_ciphersuites(cctx,
+                "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"))
+            || !TEST_true(SSL_CTX_set_ciphersuites(sctx,
+                "TLS_AES_256_GCM_SHA384"))
+            || !TEST_true(SSL_CTX_set1_groups_list(cctx, "P-256:P-384"))
+            || !TEST_true(SSL_CTX_set1_groups_list(sctx, "P-384")))
+            goto end;
+        srvid = "Unknown identity";
+        break;
+    case 16:
+        SSL_CTX_set_client_hello_cb(sctx, cert_with_extern_psk_client_hello_cb,
+            NULL);
+        break;
+    }
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL)))
+        goto end;
+
+    clientpsk = create_a_psk(clientssl, SHA256_DIGEST_LENGTH);
+    if (!TEST_ptr(clientpsk)
+        || (dtls
+            && !TEST_true(SSL_SESSION_set_protocol_version(clientpsk,
+                DTLS1_3_VERSION))))
+        goto end;
+    if (idx == 13) {
+        /* The same key, so only the length check prevents a binder failure */
+        if (!TEST_ptr(serverpsk = SSL_SESSION_dup(clientpsk))
+            || !shorten_psk(serverpsk, SSL_CERT_WITH_EXTERN_PSK_MIN_LEN - 1))
+            goto end;
+    } else {
+        if (!TEST_true(SSL_SESSION_up_ref(clientpsk)))
+            goto end;
+        serverpsk = clientpsk;
+    }
+    if (idx == 12
+        && !shorten_psk(clientpsk, SSL_CERT_WITH_EXTERN_PSK_MIN_LEN - 1))
+        goto end;
+
+    if (idx == 5 || idx == 15) {
+        if (!TEST_false(create_ssl_connection(serverssl, clientssl,
+                SSL_ERROR_SSL))
+            || !TEST_int_eq(ERR_GET_REASON(ERR_get_error()),
+                idx == 5 ? SSL_R_MISSING_CERT_WITH_EXTERN_PSK_EXTENSION
+                         : SSL_R_BAD_PSK))
+            goto end;
+        testresult = 1;
+        goto end;
+    }
+
+    if (idx == 11) {
+        if (!TEST_false(create_ssl_connection(serverssl, clientssl,
+                SSL_ERROR_SSL))
+            || !TEST_int_eq(ERR_GET_REASON(ERR_get_error()),
+                SSL_R_PEER_DID_NOT_RETURN_A_CERTIFICATE)
+            || !TEST_int_eq(find_session_cb_cnt, 1)
+            || !TEST_false(SSL_session_reused(serverssl)))
+            goto end;
+        testresult = 1;
+        goto end;
+    }
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE))
+        || !TEST_int_eq(SSL_cert_with_extern_psk_negotiated(clientssl),
+            negotiated)
+        || !TEST_int_eq(SSL_cert_with_extern_psk_negotiated(serverssl),
+            negotiated)
+        || !TEST_int_eq(SSL_session_reused(clientssl), usepsk)
+        || !TEST_int_eq(SSL_session_reused(serverssl), usepsk))
+        goto end;
+
+    /* The client only offers a PSK that is long enough and matches a hash */
+    if (!TEST_int_eq(find_session_cb_cnt > 0, idx != 10 && idx != 12))
+        goto end;
+
+    /* Unless the PSK alone is used the server authenticates with its cert */
+    if (idx == 16) {
+        if (!TEST_ptr_null(SSL_get0_peer_certificate(clientssl)))
+            goto end;
+    } else if (!TEST_ptr(SSL_get0_peer_certificate(clientssl))
+        || !TEST_long_eq(SSL_get_verify_result(clientssl), X509_V_OK)) {
+        goto end;
+    }
+
+    if (idx == 1
+        && !TEST_ptr(SSL_get0_peer_certificate(serverssl)))
+        goto end;
+
+    /*
+     * As after a full handshake, the server reports success, whether or not it
+     * verified a client certificate
+     */
+    if (negotiated
+        && !TEST_long_eq(SSL_get_verify_result(serverssl), X509_V_OK))
+        goto end;
+
+    /* The key exchange must have used (EC)DHE */
+    if (negotiated
+        && !TEST_int_ne(SSL_get_negotiated_group(serverssl), NID_undef))
+        goto end;
+
+#ifndef OPENSSL_NO_EC
+    if ((idx == 2 || idx == 8)
+        && !TEST_int_eq(SSL_get_negotiated_group(serverssl),
+            NID_X9_62_prime256v1))
+        goto end;
+#endif
+
+    /* The ciphersuite matching the PSK's hash was chosen */
+    if (othercipher
+        && (!TEST_str_eq(SSL_get_cipher_name(clientssl),
+                "TLS_AES_128_GCM_SHA256")
+            || !TEST_str_eq(SSL_get_cipher_name(serverssl),
+                "TLS_AES_128_GCM_SHA256")))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    OPENSSL_free(rootcert);
+    return testresult;
+}
+
+/*
+ * A session established with "tls_cert_with_extern_psk" can be resumed as
+ * usual. While resuming, the client must not offer its external PSK as well,
+ * as without the extension the server could use it as the sole means of
+ * authentication.
+ */
+static int test_cert_with_extern_psk_resume(void)
+{
+    SSL_CTX *sctx = NULL, *sctx2 = NULL, *cctx = NULL, *cctx2 = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    SSL_SESSION *sess = NULL;
+    char *rootcert = NULL;
+    int testresult = 0;
+
+    if (!TEST_ptr(rootcert = test_mk_file_path(certsdir, "rootcert.pem"))
+        || !TEST_true(setup_cert_with_extern_psk_test(&sctx, &cctx, rootcert, 0))
+        /* A second server that has the PSK, but can't decrypt our ticket */
+        || !TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+            TLS_client_method(), TLS1_VERSION, 0, &sctx2, &cctx2, cert,
+            privkey)))
+        goto end;
+
+    SSL_CTX_set_options(cctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    SSL_CTX_set_options(sctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    SSL_CTX_set_options(sctx2, SSL_OP_CERT_WITH_EXTERN_PSK);
+    SSL_CTX_set_psk_find_session_callback(sctx2, find_session_cb);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL)))
+        goto end;
+
+    clientpsk = create_a_psk(clientssl, SHA256_DIGEST_LENGTH);
+    if (!TEST_ptr(clientpsk) || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
+    serverpsk = clientpsk;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_ptr(sess = SSL_get1_session(clientssl))
+        || !TEST_true(SSL_SESSION_is_resumable(sess)))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /* Resumption works as usual */
+    use_session_cb_cnt = find_session_cb_cnt = 0;
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_session(clientssl, sess))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_true(SSL_session_reused(clientssl))
+        || !TEST_true(SSL_session_reused(serverssl))
+        || !TEST_false(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_false(SSL_cert_with_extern_psk_negotiated(serverssl))
+        || !TEST_ptr(SSL_get0_peer_certificate(clientssl)))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /*
+     * The second server can't resume. Had we offered the external PSK, it
+     * would have accepted it.
+     */
+    use_session_cb_cnt = find_session_cb_cnt = 0;
+    if (!TEST_true(create_ssl_objects(sctx2, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_session(clientssl, sess))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_false(SSL_session_reused(clientssl))
+        || !TEST_false(SSL_session_reused(serverssl))
+        || !TEST_false(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_ptr(SSL_get0_peer_certificate(clientssl))
+        || !TEST_long_eq(SSL_get_verify_result(clientssl), X509_V_OK))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_SESSION_free(sess);
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(sctx2);
+    SSL_CTX_free(cctx);
+    SSL_CTX_free(cctx2);
+    OPENSSL_free(rootcert);
+    return testresult;
+}
+
+/*
+ * A session from a full handshake, in which the server didn't use the external
+ * PSK, lacks the PSK's protection. Rather than resume it, the client offers the
+ * PSK again. It resumes the session from that RFC 9973 handshake though, also
+ * after serialising it, as resuming that keeps the protection.
+ */
+static int test_cert_with_extern_psk_fallback_resume(void)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    SSL_SESSION *sess = NULL, *sess2 = NULL;
+    unsigned char *der = NULL;
+    const unsigned char *p;
+    char *rootcert = NULL;
+    int derlen, testresult = 0;
+
+    if (!TEST_ptr(rootcert = test_mk_file_path(certsdir, "rootcert.pem"))
+        || !TEST_true(setup_cert_with_extern_psk_test(&sctx, &cctx, rootcert,
+            0)))
+        goto end;
+
+    SSL_CTX_set_options(cctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    SSL_CTX_set_options(sctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+
+    /* The server doesn't know the PSK yet, so a full handshake takes place */
+    srvid = "Unknown identity";
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL)))
+        goto end;
+    clientpsk = create_a_psk(clientssl, SHA256_DIGEST_LENGTH);
+    if (!TEST_ptr(clientpsk) || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
+    serverpsk = clientpsk;
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE))
+        || !TEST_false(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_ptr(sess = SSL_get1_session(clientssl))
+        || !TEST_true(SSL_SESSION_is_resumable(sess))
+        || !TEST_false(sess->flags & SSL_SESS_FLAG_CERT_WITH_EXTERN_PSK))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /* Now it does, and the client offers the PSK rather than resume */
+    srvid = pskid;
+    use_session_cb_cnt = find_session_cb_cnt = 0;
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_session(clientssl, sess))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(serverssl)))
+        goto end;
+    SSL_SESSION_free(sess);
+    if (!TEST_ptr(sess = SSL_get1_session(clientssl))
+        || !TEST_true(SSL_SESSION_is_resumable(sess))
+        || !TEST_true(sess->flags & SSL_SESS_FLAG_CERT_WITH_EXTERN_PSK))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /* The serialised session keeps its mark, and the client resumes it */
+    if (!TEST_int_gt(derlen = i2d_SSL_SESSION(sess, &der), 0))
+        goto end;
+    p = der;
+    if (!TEST_ptr(sess2 = d2i_SSL_SESSION_ex(NULL, &p, derlen, libctx, NULL))
+        || !TEST_true(sess2->flags & SSL_SESS_FLAG_CERT_WITH_EXTERN_PSK))
+        goto end;
+    use_session_cb_cnt = find_session_cb_cnt = 0;
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_session(clientssl, sess2))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_true(SSL_session_reused(clientssl))
+        || !TEST_true(SSL_session_reused(serverssl))
+        || !TEST_false(SSL_cert_with_extern_psk_negotiated(clientssl)))
+        goto end;
+
+    testresult = 1;
+end:
+    OPENSSL_free(der);
+    SSL_SESSION_free(sess);
+    SSL_SESSION_free(sess2);
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    OPENSSL_free(rootcert);
+    return testresult;
+}
+
+/*
+ * A client that resumes in its first ClientHello doesn't offer its external
+ * PSK, and mustn't offer it in its second ClientHello either, where it can't
+ * add "tls_cert_with_extern_psk" anymore. Here the HelloRetryRequest selects a
+ * ciphersuite that doesn't match the ticket, but matches the external PSK.
+ */
+static int test_cert_with_extern_psk_hrr_resume(void)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    SSL_SESSION *sess = NULL;
+    char *rootcert = NULL;
+    int testresult = 0;
+
+#ifdef OPENSSL_NO_EC
+    return TEST_skip("EC is disabled");
+#endif
+
+    if (!TEST_ptr(rootcert = test_mk_file_path(certsdir, "rootcert.pem"))
+        || !TEST_true(setup_cert_with_extern_psk_test(&sctx, &cctx, rootcert, 0)))
+        goto end;
+
+    SSL_CTX_set_options(cctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    SSL_CTX_set_options(sctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+
+    /*
+     * An RFC 9973 handshake for a SHA-256 ticket, which the client resumes
+     * rather than offer the external PSK again
+     */
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL)))
+        goto end;
+    clientpsk = create_a_psk(clientssl, SHA256_DIGEST_LENGTH);
+    if (!TEST_ptr(clientpsk) || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
+    serverpsk = clientpsk;
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_ptr(sess = SSL_get1_session(clientssl))
+        || !TEST_true(SSL_SESSION_is_resumable(sess)))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+
+    use_session_cb_cnt = find_session_cb_cnt = 0;
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_ciphersuites(clientssl,
+            "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"))
+        || !TEST_true(SSL_set1_groups_list(clientssl, "P-256:P-384"))
+        || !TEST_true(SSL_set_ciphersuites(serverssl, "TLS_AES_256_GCM_SHA384"))
+        || !TEST_true(SSL_set1_groups_list(serverssl, "P-384"))
+        || !TEST_true(SSL_set_session(clientssl, sess)))
+        goto end;
+
+    clientpsk = create_a_psk(clientssl, SHA384_DIGEST_LENGTH);
+    if (!TEST_ptr(clientpsk) || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
+    serverpsk = clientpsk;
+
+    /* A full handshake rather than one with the PSK alone */
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE))
+        || !TEST_false(SSL_session_reused(clientssl))
+        || !TEST_ptr(SSL_get0_peer_certificate(clientssl)))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_SESSION_free(sess);
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    OPENSSL_free(rootcert);
+    return testresult;
+}
+
+/*
+ * The client's RFC 9973 session records the key exchange group like that of a
+ * full handshake, so both peers report it when resuming with psk_ke.
+ */
+static int test_cert_with_extern_psk_kex_group(void)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    SSL_SESSION *sess = NULL;
+    char *rootcert = NULL;
+    int group, testresult = 0;
+
+    if (!TEST_ptr(rootcert = test_mk_file_path(certsdir, "rootcert.pem"))
+        || !TEST_true(setup_cert_with_extern_psk_test(&sctx, &cctx, rootcert, 0)))
+        goto end;
+
+    SSL_CTX_set_options(cctx,
+        SSL_OP_CERT_WITH_EXTERN_PSK | SSL_OP_ALLOW_NO_DHE_KEX);
+    SSL_CTX_set_options(sctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL)))
+        goto end;
+
+    clientpsk = create_a_psk(clientssl, SHA256_DIGEST_LENGTH);
+    if (!TEST_ptr(clientpsk) || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
+    serverpsk = clientpsk;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_int_ne(group = SSL_get_negotiated_group(clientssl), NID_undef)
+        || !TEST_ptr(sess = SSL_get1_session(clientssl)))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    SSL_CTX_set_options(sctx, SSL_OP_ALLOW_NO_DHE_KEX | SSL_OP_PREFER_NO_DHE_KEX);
+    use_session_cb_cnt = find_session_cb_cnt = 0;
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_session(clientssl, sess))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_true(SSL_session_reused(clientssl))
+        || !TEST_int_eq(SSL_get_negotiated_group(serverssl), group)
+        || !TEST_int_eq(SSL_get_negotiated_group(clientssl), group))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_SESSION_free(sess);
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    OPENSSL_free(rootcert);
+    return testresult;
+}
+
+/*
+ * An RFC 9973 handshake starts a new session, as a full handshake does, so its
+ * tickets are associated with the values negotiated in that connection (RFC
+ * 9846, 4.3.10), not with those provisioned with the external PSK. Check the
+ * SNI, ALPN and timeout of both peers' sessions, that the external PSK is left
+ * alone, and that 0-RTT works when resuming with such a ticket.
+ */
+static int test_cert_with_extern_psk_session_state(void)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL, *ssl;
+    SSL_SESSION *sess = NULL;
+    const unsigned char *alpn;
+    size_t alpnlen, readbytes, written;
+    unsigned char buf[20];
+    char *rootcert = NULL;
+    int i, testresult = 0;
+
+    if (!TEST_ptr(rootcert = test_mk_file_path(certsdir, "rootcert.pem"))
+        || !TEST_true(setup_cert_with_extern_psk_test(&sctx, &cctx, rootcert, 0)))
+        goto end;
+
+    SSL_CTX_set_options(cctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    SSL_CTX_set_options(sctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    servalpn = "goodalpn";
+    SSL_CTX_set_alpn_select_cb(sctx, alpn_select_cb, NULL);
+    if (!TEST_true(SSL_CTX_set_tlsext_servername_callback(sctx, hostname_cb))
+        || !TEST_true(SSL_CTX_set_max_early_data(sctx,
+            SSL3_RT_MAX_PLAIN_LENGTH))
+        || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_tlsext_host_name(clientssl, "goodhost"))
+        || !TEST_false(SSL_set_alpn_protos(clientssl,
+            (const unsigned char *)"\x08goodalpn", 9)))
+        goto end;
+
+    /* The external PSK was provisioned with different values */
+    clientpsk = create_a_psk(clientssl, SHA256_DIGEST_LENGTH);
+    if (!TEST_ptr(clientpsk)
+        || !TEST_true(SSL_SESSION_set1_hostname(clientpsk, "pskhost"))
+        || !TEST_true(SSL_SESSION_set1_alpn_selected(clientpsk,
+            (const unsigned char *)"pskalpn", 7))
+        || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
+    serverpsk = clientpsk;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(serverssl)))
+        goto end;
+
+    /* The sessions that tickets are issued from and stored in */
+    for (i = 0; i < 2; i++) {
+        ssl = i == 0 ? clientssl : serverssl;
+        SSL_SESSION_get0_alpn_selected(SSL_get_session(ssl), &alpn, &alpnlen);
+        if (!TEST_str_eq(SSL_SESSION_get0_hostname(SSL_get_session(ssl)),
+                "goodhost")
+            || !TEST_mem_eq(alpn, alpnlen, "goodalpn", 8)
+            || !TEST_long_eq(SSL_SESSION_get_timeout(SSL_get_session(ssl)),
+                SSL_CTX_get_timeout(i == 0 ? cctx : sctx)))
+            goto end;
+    }
+    SSL_SESSION_get0_alpn_selected(clientpsk, &alpn, &alpnlen);
+    if (!TEST_str_eq(SSL_SESSION_get0_hostname(clientpsk), "pskhost")
+        || !TEST_mem_eq(alpn, alpnlen, "pskalpn", 7))
+        goto end;
+
+    if (!TEST_ptr(sess = SSL_get1_session(clientssl))
+        || !TEST_true(SSL_SESSION_is_resumable(sess)))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /* Resume with the ticket and send early data */
+    use_session_cb_cnt = find_session_cb_cnt = 0;
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_tlsext_host_name(clientssl, "goodhost"))
+        || !TEST_false(SSL_set_alpn_protos(clientssl,
+            (const unsigned char *)"\x08goodalpn", 9))
+        || !TEST_true(SSL_set_session(clientssl, sess))
+        || !TEST_true(SSL_write_early_data(clientssl, MSG1, strlen(MSG1),
+            &written))
+        || !TEST_int_eq(SSL_read_early_data(serverssl, buf, sizeof(buf),
+                            &readbytes),
+            SSL_READ_EARLY_DATA_SUCCESS)
+        || !TEST_mem_eq(buf, readbytes, MSG1, strlen(MSG1))
+        || !TEST_int_eq(SSL_get_early_data_status(serverssl),
+            SSL_EARLY_DATA_ACCEPTED)
+        || !TEST_int_eq(SSL_connect(clientssl), 1)
+        || !TEST_int_eq(SSL_get_early_data_status(clientssl),
+            SSL_EARLY_DATA_ACCEPTED)
+        || !TEST_true(SSL_session_reused(clientssl))
+        || !TEST_false(SSL_cert_with_extern_psk_negotiated(clientssl)))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_SESSION_free(sess);
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    OPENSSL_free(rootcert);
+    return testresult;
+}
+
+/*
+ * RFC 9973 doesn't allow early data with "tls_cert_with_extern_psk", so the
+ * client must not attempt 0-RTT with its external PSK.
+ */
+static int test_cert_with_extern_psk_early_data(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    SSL_SESSION *sess = NULL;
+    unsigned char buf[20];
+    size_t readbytes, written;
+    int testresult = 0;
+
+    if (!TEST_true(setupearly_data_test(&cctx, &sctx, &clientssl,
+            &serverssl, &sess, 2, SHA384_DIGEST_LENGTH, 0)))
+        goto end;
+
+    SSL_set_options(clientssl, SSL_OP_CERT_WITH_EXTERN_PSK);
+    SSL_set_options(serverssl, SSL_OP_CERT_WITH_EXTERN_PSK);
+
+    /*
+     * The external PSK allows early data, but the client sends its ClientHello
+     * without it.
+     */
+    if (!TEST_false(SSL_write_early_data(clientssl, MSG1, strlen(MSG1),
+            &written))
+        || !TEST_int_eq(SSL_get_error(clientssl, 0), SSL_ERROR_WANT_READ)
+        || !TEST_int_eq(SSL_read_early_data(serverssl, buf, sizeof(buf),
+                            &readbytes),
+            SSL_READ_EARLY_DATA_FINISH)
+        || !TEST_size_t_eq(readbytes, 0)
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_int_eq(SSL_get_early_data_status(clientssl),
+            SSL_EARLY_DATA_REJECTED)
+        || !TEST_int_eq(SSL_get_early_data_status(serverssl),
+            SSL_EARLY_DATA_NOT_SENT)
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(serverssl))
+        || !TEST_ptr(SSL_get0_peer_certificate(clientssl)))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_SESSION_free(sess);
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    return testresult;
+}
+
+/*
  * Server side PSK callbacks must be able to observe the server random via
  * SSL_get_server_random(). Prior to the fix for issue #26404 the server
  * random was only generated after the ClientHello extensions had been
@@ -9712,6 +10509,72 @@ end:
     SSL_CTX_free(cctx);
     return testresult;
 }
+
+/*
+ * RFC 9973 with a stateless server, which always sends a HelloRetryRequest.
+ * The client prefers a ciphersuite that doesn't match the external PSK's hash,
+ * so the server picks another one, which it has to pick again when it
+ * processes the second ClientHello.
+ */
+static int test_cert_with_extern_psk_stateless(void)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    char *rootcert = NULL;
+    int testresult = 0;
+
+    if (!TEST_ptr(rootcert = test_mk_file_path(certsdir, "rootcert.pem"))
+        || !TEST_true(setup_cert_with_extern_psk_test(&sctx, &cctx, rootcert, 0))
+        /* The PSK uses SHA-256 */
+        || !TEST_true(SSL_CTX_set_ciphersuites(cctx,
+            "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256")))
+        goto end;
+
+    SSL_CTX_set_options(cctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    SSL_CTX_set_options(sctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    /* The arrival of CCS messages can confuse the test */
+    SSL_CTX_clear_options(cctx, SSL_OP_ENABLE_MIDDLEBOX_COMPAT);
+    SSL_CTX_set_stateless_cookie_generate_cb(sctx, generate_stateless_cookie_callback);
+    SSL_CTX_set_stateless_cookie_verify_cb(sctx, verify_stateless_cookie_callback);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL)))
+        goto end;
+
+    clientpsk = create_a_psk(clientssl, SHA256_DIGEST_LENGTH);
+    if (!TEST_ptr(clientpsk) || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
+    serverpsk = clientpsk;
+
+    /* Send the first ClientHello */
+    if (!TEST_false(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_WANT_READ))
+        /* A HelloRetryRequest with a cookie is sent */
+        || !TEST_int_eq(SSL_stateless(serverssl), 0)
+        /* Send the second ClientHello */
+        || !TEST_false(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_WANT_READ))
+        || !TEST_int_eq(SSL_stateless(serverssl), 1)
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(serverssl))
+        || !TEST_str_eq(SSL_get_cipher_name(clientssl),
+            "TLS_AES_128_GCM_SHA256"))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    OPENSSL_free(rootcert);
+    return testresult;
+}
 #endif /* OSSL_NO_USABLE_TLS1_3 */
 #endif /* !defined(OSSL_NO_USABLE_TLS1_3) || !defined(OSSL_NO_USABLE_DTLS1_3) */
 
@@ -10100,6 +10963,106 @@ end:
     SSL_CTX_free(cctx);
     return testresult;
 }
+
+#ifndef OSSL_NO_USABLE_TLS1_3
+/*
+ * A "tls_cert_with_extern_psk" handshake uses a PSK, but it is an initial
+ * handshake with certificate-based authentication rather than a resumption.
+ * So custom extensions with SSL_EXT_IGNORE_ON_RESUMPTION must still be
+ * processed, and only be ignored once the session is actually resumed. The
+ * extension itself is handled internally, so it can't be a custom extension.
+ */
+static int test_cert_with_extern_psk_custom_ext(void)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    SSL_SESSION *sess = NULL;
+    char *rootcert = NULL;
+    static int server = 1;
+    static int client = 0;
+    const unsigned int context = SSL_EXT_CLIENT_HELLO
+        | SSL_EXT_TLS1_3_SERVER_HELLO
+        | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS
+        | SSL_EXT_TLS1_3_CERTIFICATE
+        | SSL_EXT_IGNORE_ON_RESUMPTION;
+    int testresult = 0;
+
+    clntaddnewcb = clntparsenewcb = srvaddnewcb = srvparsenewcb = 0;
+
+    if (!TEST_ptr(rootcert = test_mk_file_path(certsdir, "rootcert.pem"))
+        || !TEST_true(setup_cert_with_extern_psk_test(&sctx, &cctx, rootcert, 0))
+        || !TEST_true(SSL_extension_supported(TLSEXT_TYPE_cert_with_extern_psk))
+        || !TEST_false(SSL_CTX_add_custom_ext(cctx,
+            TLSEXT_TYPE_cert_with_extern_psk, context,
+            new_add_cb, new_free_cb,
+            &client, new_parse_cb, &client))
+        || !TEST_true(SSL_CTX_add_custom_ext(cctx, TEST_EXT_TYPE1, context,
+            new_add_cb, new_free_cb,
+            &client, new_parse_cb, &client))
+        || !TEST_true(SSL_CTX_add_custom_ext(sctx, TEST_EXT_TYPE1, context,
+            new_add_cb, new_free_cb,
+            &server, new_parse_cb, &server)))
+        goto end;
+
+    SSL_CTX_set_options(cctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+    SSL_CTX_set_options(sctx, SSL_OP_CERT_WITH_EXTERN_PSK);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL)))
+        goto end;
+
+    clientpsk = create_a_psk(clientssl, SHA256_DIGEST_LENGTH);
+    if (!TEST_ptr(clientpsk) || !TEST_true(SSL_SESSION_up_ref(clientpsk)))
+        goto end;
+    serverpsk = clientpsk;
+
+    /* The extension is in the ClientHello, ServerHello, EE and Certificate */
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl, SSL_ERROR_NONE))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_true(SSL_cert_with_extern_psk_negotiated(serverssl))
+        || !TEST_int_eq(clntaddnewcb, 1)
+        || !TEST_int_eq(srvparsenewcb, 1)
+        || !TEST_int_eq(srvaddnewcb, 3)
+        || !TEST_int_eq(clntparsenewcb, 3)
+        || !TEST_ptr(sess = SSL_get1_session(clientssl)))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /*
+     * When resuming, the client still sends the extension, but the server
+     * ignores it.
+     */
+    use_session_cb_cnt = find_session_cb_cnt = 0;
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_session(clientssl, sess))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_true(SSL_session_reused(clientssl))
+        || !TEST_true(SSL_session_reused(serverssl))
+        || !TEST_false(SSL_cert_with_extern_psk_negotiated(clientssl))
+        || !TEST_false(SSL_cert_with_extern_psk_negotiated(serverssl))
+        || !TEST_int_eq(clntaddnewcb, 2)
+        || !TEST_int_eq(srvparsenewcb, 1)
+        || !TEST_int_eq(srvaddnewcb, 3)
+        || !TEST_int_eq(clntparsenewcb, 3))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_SESSION_free(sess);
+    SSL_SESSION_free(clientpsk);
+    SSL_SESSION_free(serverpsk);
+    clientpsk = serverpsk = NULL;
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    OPENSSL_free(rootcert);
+    return testresult;
+}
+#endif /* OSSL_NO_USABLE_TLS1_3 */
 
 #if (!defined(OPENSSL_NO_TLS1_2) && !defined(OSSL_NO_USABLE_TLS1_3)) \
     || (!defined(OPENSSL_NO_DTLS1_2) && !defined(OSSL_NO_USABLE_DTLS1_3))
@@ -19935,6 +20898,13 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_dtls_psk_cb_server_random, 4);
 #endif
     ADD_TEST(test_tls13_psk_verify_peer_no_ticket);
+    ADD_ALL_TESTS(test_cert_with_extern_psk, 17);
+    ADD_TEST(test_cert_with_extern_psk_resume);
+    ADD_TEST(test_cert_with_extern_psk_fallback_resume);
+    ADD_TEST(test_cert_with_extern_psk_hrr_resume);
+    ADD_TEST(test_cert_with_extern_psk_kex_group);
+    ADD_TEST(test_cert_with_extern_psk_session_state);
+    ADD_TEST(test_cert_with_extern_psk_early_data);
 #endif /* !defined(OSSL_NO_USABLE_TLS1_3) */
 #if !defined(OSSL_NO_USABLE_TLS1_3)
 #ifndef OPENSSL_NO_TLS1_2
@@ -19952,6 +20922,7 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_suiteb_tls13_groups, 24);
 #endif
     ADD_ALL_TESTS(test_custom_exts, 6);
+    ADD_TEST(test_cert_with_extern_psk_custom_ext);
     ADD_TEST(test_pha_key_update);
 #else
     ADD_ALL_TESTS(test_custom_exts, 3);
@@ -19959,6 +20930,7 @@ int setup_tests(void)
 #ifndef OSSL_NO_USABLE_TLS1_3
     ADD_TEST(test_stateless);
     ADD_TEST(test_stateless_psk);
+    ADD_TEST(test_cert_with_extern_psk_stateless);
 #endif
     ADD_ALL_TESTS(test_export_key_mat, 6);
 #if !defined(OSSL_NO_USABLE_TLS1_3) || !defined(OSSL_NO_USABLE_DTLS1_3)
